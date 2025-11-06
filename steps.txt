@@ -1,0 +1,507 @@
+Nice — here’s a complete, practical **step-by-step backend guide** you can copy/run to get Kavach 2.0 backend working. I’ll include:
+
+* environment setup commands
+* a suggested project layout
+* runnable example code for: FastAPI + REST, WebSocket, MQTT subscriber, TCP socket server (hardware), SQLite (SQLAlchemy), preprocessing, and a model-call stub
+* how to simulate sensors and test everything
+* Docker + production tips, logging, and troubleshooting notes
+
+I made the examples small but realistic so you can paste & run them immediately.
+
+---
+
+# 1) Create a Python virtual environment & install packages
+
+```powershell
+# from your project root (Windows PowerShell shown)
+python -m venv venv
+venv\Scripts\activate
+
+# create a requirements file (below) then install:
+pip install -r requirements.txt
+```
+
+**requirements.txt** (save in project root)
+
+```
+fastapi==0.100.0
+uvicorn[standard]==0.23.2
+paho-mqtt==1.6.4
+asyncio-mqtt==0.14.0
+sqlalchemy==2.1.0
+databases==0.8.0        # optional async DB helper
+aiosqlite==0.18.0
+python-dotenv==1.0.0
+pydantic==2.2.0
+websockets==11.0.3
+loguru==0.7.0
+numpy==1.26.0
+# add your DL framework used locally (example):
+torch==2.2.0  # or tensorflow
+```
+
+> Adjust versions to your environment. If you use a GPU or conda, install torch/tf using their recommended commands.
+
+---
+
+# 2) Suggested folder structure
+
+```
+kavach-backend/
+├── app/
+│   ├── main.py                # FastAPI app (REST + WebSockets)
+│   ├── mqtt_client.py         # MQTT subscriber, forwards to internal queue
+│   ├── socket_server.py       # TCP socket server for hardware streams (optional)
+│   ├── db.py                  # SQLAlchemy / DB utilities
+│   ├── models.py              # DB models + Pydantic schemas
+│   ├── preprocess.py          # sensor parsing & normalization
+│   ├── model_runner.py        # loads DL model & run predictions
+│   └── utils.py               # logging, config helpers
+├── simulations/
+│   ├── simulate_mqtt_sensor.py
+│   └── simulate_tcp_sensor.py
+├── requirements.txt
+├── .env
+└── Dockerfile
+```
+
+---
+
+# 3) Basic config (.env)
+
+Create `.env`:
+
+```
+MQTT_BROKER=localhost
+MQTT_PORT=1883
+MQTT_TOPIC=kavach/sensors/#
+DB_URL=sqlite+aiosqlite:///./kavach.db
+WS_BROADCAST_PATH=/ws/alerts
+MODEL_PATH=./models/fog_model.pt
+```
+
+Load with `python-dotenv` or `os.getenv`.
+
+---
+
+# 4) Database (async SQLAlchemy) — `app/db.py`
+
+```python
+# app/db.py
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
+import os
+
+DATABASE_URL = os.getenv("DB_URL", "sqlite+aiosqlite:///./kavach.db")
+engine = create_async_engine(DATABASE_URL, future=True, echo=False)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+Base = declarative_base()
+
+# helper
+async def get_session():
+    async with AsyncSessionLocal() as session:
+        yield session
+```
+
+Define models in `app/models.py`:
+
+```python
+# app/models.py
+from sqlalchemy import Column, Integer, Float, String, DateTime
+from sqlalchemy.sql import func
+from .db import Base
+
+class SensorEvent(Base):
+    __tablename__ = "sensor_events"
+    id = Column(Integer, primary_key=True, index=True)
+    sensor_type = Column(String, nullable=False)
+    raw_payload = Column(String, nullable=False)
+    parsed_value = Column(String)
+    prediction = Column(String)
+    risk_level = Column(String)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+```
+
+Create DB tables (one-off script):
+
+```python
+# create_db.py
+import asyncio
+from app.db import engine, Base
+async def init():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+if __name__ == "__main__":
+    asyncio.run(init())
+```
+
+Run: `python create_db.py`
+
+---
+
+# 5) Preprocessing — `app/preprocess.py`
+
+```python
+# app/preprocess.py
+import json
+import numpy as np
+
+def parse_sensor_message(sensor_type: str, raw: bytes) -> dict:
+    """
+    Example: unify LiDAR, radar, camera payloads to a schema.
+    """
+    try:
+        if sensor_type == "lidar":
+            # assume JSON bytes for demo
+            data = json.loads(raw.decode())
+            return {"distance": float(data.get("distance")), "confidence": float(data.get("c"))}
+        elif sensor_type == "radar":
+            data = json.loads(raw.decode())
+            return {"speed": float(data.get("speed")), "range": float(data.get("range"))}
+        elif sensor_type == "camera":
+            # camera might send metadata or base64; here we parse metadata
+            data = json.loads(raw.decode())
+            return {"visibility": float(data.get("visibility")), "frame_id": data.get("id")}
+        else:
+            return {"raw": raw.decode()}
+    except Exception as e:
+        return {"error": str(e), "raw": raw.decode(errors="ignore")}
+```
+
+---
+
+# 6) Model runner stub — `app/model_runner.py`
+
+Use your DL library here. This is a synchronous stub wrapped for async usage:
+
+```python
+# app/model_runner.py
+import asyncio
+# import torch, torchvision etc.
+import random
+
+class ModelRunner:
+    def __init__(self, model_path: str = None):
+        # load your model here, GPU/CPU selection
+        # self.model = torch.load(model_path, map_location="cpu")
+        self.model_path = model_path
+
+    async def predict(self, parsed_payload: dict) -> dict:
+        # wrap heavy sync inference using threadpool
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._sync_predict, parsed_payload)
+
+    def _sync_predict(self, parsed_payload: dict) -> dict:
+        # Replace with actual model inference logic
+        # Example: return fog intensity & risk level
+        fog_intensity = parsed_payload.get("visibility", random.random())
+        risk = "HIGH" if fog_intensity < 0.3 else ("MEDIUM" if fog_intensity < 0.6 else "LOW")
+        return {"fog_intensity": float(fog_intensity), "risk": risk}
+```
+
+Instantiate a single `ModelRunner` in `main.py` (see below).
+
+---
+
+# 7) MQTT client — `app/mqtt_client.py`
+
+We’ll use `asyncio-mqtt` to subscribe and dispatch messages into an internal queue:
+
+```python
+# app/mqtt_client.py
+import asyncio
+from asyncio_mqtt import Client, MqttError
+import os
+from loguru import logger
+
+MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
+TOPIC = os.getenv("MQTT_TOPIC", "kavach/sensors/#")
+
+async def mqtt_loop(queue: asyncio.Queue):
+    """
+    Subscribe to MQTT and push (topic, payload) to queue for processing by FastAPI tasks.
+    """
+    async with Client(MQTT_BROKER, port=MQTT_PORT) as client:
+        async with client.unfiltered_messages() as messages:
+            await client.subscribe(TOPIC)
+            logger.info(f"Subscribed to {TOPIC}")
+            async for msg in messages:
+                topic = msg.topic
+                payload = msg.payload  # bytes
+                await queue.put(("mqtt", topic, payload))
+```
+
+---
+
+# 8) TCP Socket server for direct hardware — `app/socket_server.py`
+
+A small asyncio TCP server that accepts byte streams from hardware and pushes to the same queue:
+
+```python
+# app/socket_server.py
+import asyncio
+from loguru import logger
+
+async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, queue: asyncio.Queue):
+    addr = writer.get_extra_info("peername")
+    logger.info(f"Hardware connected: {addr}")
+    try:
+        while True:
+            data = await reader.readline()  # or readexactly(...) depending on protocol
+            if not data:
+                break
+            await queue.put(("tcp", addr, data))
+    except Exception as e:
+        logger.exception("socket error")
+    finally:
+        writer.close()
+        await writer.wait_closed()
+        logger.info(f"Connection closed: {addr}")
+
+async def start_tcp_server(host="0.0.0.0", port=9000, queue=None):
+    server = await asyncio.start_server(lambda r,w: handle_connection(r,w,queue), host, port)
+    logger.info(f"Socket server listening on {host}:{port}")
+    async with server:
+        await server.serve_forever()
+```
+
+---
+
+# 9) FastAPI app (REST + WebSocket + background worker) — `app/main.py`
+
+This ties everything together. It starts background tasks (MQTT + socket server + processor), exposes REST endpoints and a WebSocket to push alerts to connected UIs.
+
+```python
+# app/main.py
+import asyncio
+import os
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
+from fastapi.responses import JSONResponse
+import uvicorn
+from loguru import logger
+
+from .preprocess import parse_sensor_message
+from .model_runner import ModelRunner
+from .mqtt_client import mqtt_loop
+from .socket_server import start_tcp_server
+from .db import get_session
+from .models import SensorEvent
+
+app = FastAPI(title="Kavach Backend")
+
+# Shared queue for incoming sensor messages (simple design)
+message_queue: asyncio.Queue = asyncio.Queue()
+model_runner = ModelRunner(model_path=os.getenv("MODEL_PATH"))
+
+# store connected websockets
+connected_ws: set[WebSocket] = set()
+
+@app.on_event("startup")
+async def startup_event():
+    # launch background tasks
+    loop = asyncio.get_event_loop()
+    loop.create_task(mqtt_loop(message_queue))
+    loop.create_task(start_tcp_server(host="0.0.0.0", port=9000, queue=message_queue))
+    loop.create_task(process_messages_loop())
+
+@app.post("/api/ping")
+async def ping():
+    return {"status": "ok"}
+
+@app.websocket("/ws/alerts")
+async def ws_alerts_endpoint(ws: WebSocket):
+    await ws.accept()
+    connected_ws.add(ws)
+    try:
+        while True:
+            await ws.receive_text()  # keep the connection alive or handle client messages
+    except WebSocketDisconnect:
+        connected_ws.remove(ws)
+
+async def broadcast_alert(alert: dict):
+    # send alert to all connected clients (non-blocking)
+    living = set()
+    for ws in list(connected_ws):
+        try:
+            await ws.send_json(alert)
+            living.add(ws)
+        except Exception:
+            logger.info("WebSocket send failed, removing client")
+    connected_ws.clear()
+    connected_ws.update(living)
+
+async def process_messages_loop():
+    """
+    Worker: read queue, preprocess, call model, store to DB, and emit alerts via WebSocket
+    """
+    while True:
+        source, topic_or_addr, payload = await message_queue.get()
+        # simple topic parsing: mqtt topic format kavach/sensors/<type>
+        sensor_type = "unknown"
+        if source == "mqtt":
+            sensor_type = topic_or_addr.split("/")[-1]  # example
+        elif source == "tcp":
+            # assume payload includes sensor label prefix
+            pass
+
+        parsed = parse_sensor_message(sensor_type, payload)
+        prediction = await model_runner.predict(parsed)
+        alert = {
+            "sensor": sensor_type,
+            "parsed": parsed,
+            "prediction": prediction,
+            "source": source,
+        }
+        # broadcast over WS
+        await broadcast_alert(alert)
+
+        # store to DB (fire and forget)
+        try:
+            async for db in get_session():  # get_session is async generator
+                ev = SensorEvent(sensor_type=sensor_type, raw_payload=payload.decode(errors="ignore"),
+                                 parsed_value=str(parsed), prediction=str(prediction),
+                                 risk_level=prediction.get("risk", "UNKNOWN"))
+                db.add(ev)
+                await db.commit()
+                break
+        except Exception as e:
+            logger.exception("DB write failed")
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+```
+
+> Notes: `get_session()` in `db.py` was a generator; adjust commit logic to your async DB setup (I provided a quick example). You can also use `databases` package for simpler async DB writes.
+
+---
+
+# 10) Simulate sensors to test the pipeline
+
+**simulate_mqtt_sensor.py**
+
+```python
+# simulations/simulate_mqtt_sensor.py
+import time, json
+import paho.mqtt.client as mqtt
+
+broker = "localhost"
+port = 1883
+topic = "kavach/sensors/lidar"
+
+client = mqtt.Client()
+client.connect(broker, port, 60)
+
+try:
+    while True:
+        payload = json.dumps({"distance": 12.3, "c": 0.98})
+        client.publish(topic, payload)
+        print("Published", payload)
+        time.sleep(1)
+except KeyboardInterrupt:
+    client.disconnect()
+```
+
+**simulate_tcp_sensor.py**
+
+```python
+# simulations/simulate_tcp_sensor.py
+import socket, time, json
+s = socket.create_connection(("localhost", 9000))
+for i in range(10):
+    payload = json.dumps({"visibility": 0.2 + i*0.05}) + "\n"
+    s.send(payload.encode())
+    time.sleep(1)
+s.close()
+```
+
+Run Mosquitto broker locally for MQTT testing:
+
+* Windows: install Mosquitto and run `mosquitto` or use Docker:
+  `docker run -it -p 1883:1883 eclipse-mosquitto`
+
+---
+
+# 11) Running the entire backend
+
+1. Start Mosquitto (or ensure MQTT broker running).
+2. Activate venv.
+3. Run DB creation script:
+
+   ```bash
+   python create_db.py
+   ```
+4. Start backend:
+
+   ```bash
+   uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+   ```
+5. Start a sensor simulator:
+
+   ```bash
+   python simulations/simulate_mqtt_sensor.py
+   ```
+6. Open websocket client or frontend that connects to `ws://localhost:8000/ws/alerts` to receive alerts.
+
+---
+
+# 12) Testing & Debugging tips
+
+* Use **curl** to check REST: `curl http://localhost:8000/api/ping`
+* Use **wscat** or browser devtools to test WebSocket:
+  `npm install -g wscat` then `wscat -c ws://localhost:8000/ws/alerts`
+* Monitor DB with `sqlite3 kavach.db` or a GUI (DB Browser for SQLite)
+* Increase logging with `loguru` to see stack traces and message flows
+
+---
+
+# 13) Security & Production Notes
+
+* Require authentication for critical REST endpoints and WebSockets (JWT or API key)
+* Limit MQTT topics or use broker ACLs for sensors
+* For production, move DB to a proper server (Postgres) and use connection pooling
+* Use HTTPS / WSS behind a reverse proxy (nginx) and add rate-limiting
+* Run background workers with a process manager (systemd / supervisor) or container orchestrator (Kubernetes)
+* Add unit tests for preprocess & model runner
+
+---
+
+# 14) Dockerfile (simple)
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+Build & run:
+
+```bash
+docker build -t kavach-backend .
+docker run -e MQTT_BROKER=host.docker.internal -p 8000:8000 kavach-backend
+```
+
+---
+
+# 15) Next steps / optional improvements
+
+* Add **message validation** with Pydantic schemas for sensor messages.
+* Implement **buffering & batching** of sensor data for the model (improves throughput).
+* Support **edge inference**: run model on a local device (Raspberry Pi / Jetson).
+* Add metrics (Prometheus) and health checks.
+* Add persistent job/queue (Redis + RQ or Celery) if inference becomes heavy.
+
+---
+
+If you want, I can:
+
+* generate ready-to-run files for each of the above (I can paste full files into the chat), or
+* produce a minimal starter repository you can drop into your project and run, or
+* tailor the pipeline to your chosen DL framework (PyTorch vs TensorFlow) and hardware (Jetson/RPi).
+
+Which of those would you like next?
